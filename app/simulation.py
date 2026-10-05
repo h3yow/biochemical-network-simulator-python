@@ -30,6 +30,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.integrate import solve_ivp
 
+from .composition import conservation_laws
 from .errors import ErrorCode, SimulationError
 from .models import Network
 from .validation import validate_network
@@ -45,6 +46,25 @@ _solution_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
 
 @dataclass(frozen=True)
+class ConservationDrift:
+    """Drift of one conservation law along a trajectory.
+
+    ``weights`` is the exact integer weighted sum (species -> weight),
+    ``initial_value`` its value at t=0, ``max_deviation`` the largest
+    absolute departure from that value, and ``tolerance`` the actually
+    applied (scaled) limit that was required to hold.
+    """
+
+    name: str
+    origin: str
+    weights: dict[str, int]
+    initial_value: float
+    max_deviation: float
+    tolerance: float
+    within_tolerance: bool
+
+
+@dataclass(frozen=True)
 class Trajectory:
     """Simulation result: time points and concentrations."""
 
@@ -54,10 +74,17 @@ class Trajectory:
     conserved_total: float
     max_conservation_deviation: float
     min_concentration: float
+    conservation_laws: tuple[ConservationDrift, ...] = ()
 
 
 def network_fingerprint(network: Network) -> str:
-    """Canonical fingerprint covering every field that affects results."""
+    """Canonical fingerprint covering every field that affects results.
+
+    Legacy networks (no composition) produce exactly the same payload as
+    before, so their fingerprints are bit-for-bit unchanged; networks
+    that merely share species names but differ in composition get
+    different fingerprints and therefore never share cached results.
+    """
     payload = {
         "version": network.version,
         "species": sorted(network.species.items()),
@@ -75,6 +102,11 @@ def network_fingerprint(network: Network) -> str:
             for r in network.reactions
         ],
     }
+    if network.has_composition:
+        payload["composition"] = [
+            [species, sorted(entry.items())]
+            for species, entry in sorted(network.composition.items())
+        ]
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()
 
@@ -186,8 +218,12 @@ def simulate(
 ) -> Trajectory:
     """Simulate the network deterministically on [t_start, t_end].
 
-    Enforces: total mass conserved within ``conservation_tol`` for closed
-    networks; no non-physical negative concentrations. Raises
+    Enforces, for a closed network, *every* independent conservation law
+    of the network (named atom/group laws when composition is declared,
+    plus any structural laws), each within ``conservation_tol`` scaled by
+    its own initial magnitude; the first law exceeding its tolerance
+    fails the run with a message naming that law and its drift. Also
+    enforces no non-physical negative concentrations. Raises
     SimulationError with a distinguishing code otherwise.
     """
     validate_network(network)
@@ -207,16 +243,69 @@ def simulate(
 
     # --- invariant checks on the fine (unsampled) trajectory ---
     free_idx = [i for i, s in enumerate(species) if s not in network.boundary_species]
-    totals = y_fine[:, free_idx].sum(axis=1)
-    conserved_total = float(totals[0])
-    max_dev = float(np.max(np.abs(totals - conserved_total)))
-    scale = max(abs(conserved_total), 1.0)
-    if network.closed and max_dev > conservation_tol * scale:
+
+    # The network's own conservation quantities: every independent
+    # weighted sum of the stoichiometric left null space is checked
+    # separately, so a network with several independent invariants gets
+    # one drift report each. Derived from exact rationals (or named
+    # atom/group laws when composition is present), these depend only on
+    # the network -- never on the output grid -- so refining steps,
+    # splitting intervals and concurrent requests all see identical
+    # laws and identical verdicts.
+    laws = conservation_laws(network, species) if network.closed else ()
+    drifts: list[ConservationDrift] = []
+    violations: list[str] = []
+    for law in laws:
+        w = np.array([float(law.weights.get(s, 0)) for s in species])
+        values = y_fine @ w
+        initial = float(values[0])
+        max_dev = float(np.max(np.abs(values - initial)))
+        tol = conservation_tol * max(abs(initial), 1.0)
+        ok = max_dev <= tol
+        drifts.append(
+            ConservationDrift(
+                name=law.name,
+                origin=law.origin,
+                weights=dict(law.weights),
+                initial_value=initial,
+                max_deviation=max_dev,
+                tolerance=tol,
+                within_tolerance=ok,
+            )
+        )
+        if not ok:
+            violations.append(
+                f"conservation '{law.name}' {law.weights} deviates by "
+                f"{max_dev:.3e} (tolerance {tol:.3e}, initial {initial:.6g})"
+            )
+    if violations:
         raise SimulationError(
             ErrorCode.CONSERVATION_VIOLATION,
-            f"total mass deviates by {max_dev:.3e} (tolerance "
-            f"{conservation_tol * scale:.3e}) over [0, {t_end}]",
+            f"{len(violations)} of {len(laws)} conservation law(s) "
+            f"violated over [0, {t_end}]: " + "; ".join(violations),
         )
+
+    # legacy scalar summary: the plain total over free species if that
+    # sum is itself one of the network's invariants, otherwise the first
+    # reported law; for the historical 1:1 closed networks both coincide
+    # exactly with the previous behavior
+    totals = y_fine[:, free_idx].sum(axis=1)
+    backing = next(
+        (
+            d
+            for d in drifts
+            if set(d.weights) == {species[i] for i in free_idx}
+            and all(d.weights.get(species[i], 0) == 1 for i in free_idx)
+        ),
+        drifts[0] if drifts else None,
+    )
+    if backing is not None:
+        conserved_total = backing.initial_value
+        max_dev = backing.max_deviation
+    else:
+        conserved_total = float(totals[0])
+        max_dev = float(np.max(np.abs(totals - conserved_total)))
+
     min_conc = float(np.min(y_fine[:, free_idx])) if free_idx else 0.0
     if min_conc < -_NEG_TOL:
         raise SimulationError(
@@ -232,4 +321,5 @@ def simulate(
         conserved_total=conserved_total,
         max_conservation_deviation=max_dev,
         min_concentration=max(min_conc, 0.0) if min_conc > -_NEG_TOL else min_conc,
+        conservation_laws=tuple(drifts),
     )

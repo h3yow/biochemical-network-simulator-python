@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 
+from .composition import check_reaction_balance, validate_composition
 from .errors import ErrorCode, NetworkValidationError
 from .models import Network, RateLaw, Reaction
 
@@ -84,7 +85,10 @@ def _check_reaction(network: Network, reaction: Reaction) -> None:
     _check_rate_law(reaction.name, reaction.rate, "forward")
     if reaction.reverse is not None:
         _check_rate_law(reaction.name, reaction.reverse, "reverse")
-        # enzyme of a Michaelis-Menten law must be a known species
+    # atom/group balance against the composition table (both directions);
+    # a no-op for legacy networks that carry no composition
+    check_reaction_balance(network, reaction)
+    # enzyme of a Michaelis-Menten law must be a known species
     for law in (reaction.rate, reaction.reverse):
         if law is not None and law.kind == "michaelis_menten":
             enzyme = law.params["enzyme"]
@@ -100,6 +104,8 @@ def validate_network(network: Network) -> None:
     """Validate a network, raising NetworkValidationError on any problem.
 
     Checks (each mapped to a distinct ErrorCode):
+      - invalid composition declarations           -> INVALID_COMPOSITION
+      - atom-unbalanced reaction (forward/reverse) -> UNBALANCED_REACTION
       - unknown species references (incl. enzymes) -> MISSING_SPECIES
       - non-positive / non-finite stoichiometry    -> ILLEGAL_STOICHIOMETRY
       - negative / non-finite / incomplete rates   -> INFEASIBLE_RATE
@@ -122,5 +128,6 @@ def validate_network(network: Network) -> None:
                 ErrorCode.MISSING_SPECIES,
                 f"boundary species '{boundary}' is not declared in species",
             )
+    validate_composition(network)
     for reaction in network.reactions:
         _check_reaction(network, reaction)

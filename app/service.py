@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from .errors import ErrorCode, NetworkError, NetworkValidationError
 from .models import Network, RateLaw, Reaction
-from .scanning import perturb_parameter
+from .scanning import ScanPoint, safe_scan_parameter
 from .simulation import network_fingerprint, simulate
 from .validation import validate_network
 
@@ -39,6 +39,7 @@ class NetworkIn(BaseModel):
     species: dict[str, float]
     reactions: list[ReactionIn] = Field(default_factory=list)
     boundary_species: list[str] = Field(default_factory=list)
+    composition: dict[str, dict[str, float]] | None = None
     version: str = "1"
 
 
@@ -80,6 +81,9 @@ def _to_domain(net: NetworkIn) -> Network:
             for r in net.reactions
         ),
         boundary_species=frozenset(net.boundary_species),
+        composition={} if net.composition is None else {
+            species: dict(entry) for species, entry in net.composition.items()
+        },
         version=net.version,
     )
 
@@ -92,6 +96,18 @@ def _trajectory_json(tr) -> dict[str, Any]:
         "conserved_total": tr.conserved_total,
         "max_conservation_deviation": tr.max_conservation_deviation,
         "min_concentration": tr.min_concentration,
+        "conservation_laws": [
+            {
+                "name": d.name,
+                "origin": d.origin,
+                "weights": d.weights,
+                "initial_value": d.initial_value,
+                "max_deviation": d.max_deviation,
+                "tolerance": d.tolerance,
+                "within_tolerance": d.within_tolerance,
+            }
+            for d in tr.conservation_laws
+        ],
     }
 
 
@@ -131,18 +147,46 @@ def create_app() -> FastAPI:
 
     @app.post("/scan")
     def scan_endpoint(req: ScanIn) -> dict[str, Any]:
-        network = _to_domain(req.network)
-        results = []
-        for value in req.values:
-            perturbed = perturb_parameter(network, req.reaction, req.param, value)
-            tr = simulate(perturbed, t_end=req.t_end, n_points=req.n_points)
-            results.append(
-                {
-                    "value": value,
-                    "fingerprint": network_fingerprint(perturbed),
-                    "trajectory": _trajectory_json(tr),
-                }
+        try:
+            network = _to_domain(req.network)
+            points = safe_scan_parameter(
+                network,
+                reaction=req.reaction,
+                param=req.param,
+                values=req.values,
+                t_end=req.t_end,
+                n_points=req.n_points,
             )
+        except NetworkError as exc:
+            # the base network itself cannot be built/validated, or the
+            # scanned reaction/parameter does not exist: every point fails
+            # for the same locatable reason, reported per point rather
+            # than as one request-level rejection
+            points = [
+                ScanPoint(value=value, ok=False,
+                          error_code=exc.code.value, error_detail=exc.detail)
+                for value in req.values
+            ]
+        results = []
+        for point in points:
+            if point.ok:
+                results.append(
+                    {
+                        "value": point.value,
+                        "ok": True,
+                        "fingerprint": point.fingerprint,
+                        "trajectory": _trajectory_json(point.trajectory),
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "value": point.value,
+                        "ok": False,
+                        "code": point.error_code,
+                        "detail": point.error_detail,
+                    }
+                )
         return {"results": results}
 
     return app
