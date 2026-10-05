@@ -19,6 +19,81 @@ _RATE_LAW_PARAMS: dict[str, frozenset[str]] = {
     "michaelis_menten": frozenset({"kcat", "Km", "enzyme"}),
 }
 
+#: relative tolerance for element-balance checks on stoichiometry
+_BALANCE_TOL = 1e-9
+
+
+def _check_composition_declarations(network: Network) -> None:
+    """Validate composition declarations (all-or-nothing, positive counts).
+
+    Skipped entirely for legacy networks without any composition, so their
+    verdicts are unchanged. When compositions ARE declared, every declared
+    species must carry one and every count must be a finite positive number.
+    """
+    comps = network.compositions
+    if not comps:
+        return
+    for name in comps:
+        if name not in network.species:
+            raise NetworkValidationError(
+                ErrorCode.MISSING_SPECIES,
+                f"composition declared for unknown species '{name}'",
+            )
+    for name in network.species:
+        if name not in comps:
+            raise NetworkValidationError(
+                ErrorCode.INVALID_COMPOSITION,
+                f"species '{name}' has no composition while other species "
+                f"do (compositions are all-or-nothing)",
+            )
+    for name, comp in comps.items():
+        if not comp:
+            raise NetworkValidationError(
+                ErrorCode.INVALID_COMPOSITION,
+                f"species '{name}' declares an empty composition",
+            )
+        for element, count in comp.items():
+            if not isinstance(element, str) or not element:
+                raise NetworkValidationError(
+                    ErrorCode.INVALID_COMPOSITION,
+                    f"species '{name}' has invalid element name {element!r}",
+                )
+            if not isinstance(count, (int, float)) or not math.isfinite(count) or count <= 0:
+                raise NetworkValidationError(
+                    ErrorCode.INVALID_COMPOSITION,
+                    f"species '{name}' element '{element}' count must be a "
+                    f"finite positive number, got {count!r}",
+                )
+
+
+def _check_element_balance(network: Network) -> None:
+    """Check every reaction conserves each element (forward and reverse
+    share the same stoichiometry, so one check covers both directions).
+    Any imbalance is reported with the exact reaction, element and both
+    sides' totals; nothing is silently corrected."""
+    comps = network.compositions
+    if not comps:
+        return
+    elements = sorted({e for comp in comps.values() for e in comp})
+    for reaction in network.reactions:
+        for element in elements:
+            lhs = sum(
+                coeff * comps[species].get(element, 0.0)
+                for species, coeff in reaction.reactants.items()
+            )
+            rhs = sum(
+                coeff * comps[species].get(element, 0.0)
+                for species, coeff in reaction.products.items()
+            )
+            limit = _BALANCE_TOL * max(abs(lhs), abs(rhs), 1.0)
+            if abs(lhs - rhs) > limit:
+                raise NetworkValidationError(
+                    ErrorCode.UNBALANCED_REACTION,
+                    f"reaction '{reaction.name}' does not conserve element "
+                    f"'{element}': reactants supply {lhs!r}, products "
+                    f"{rhs!r} (|diff|={abs(lhs - rhs):.3e} > {limit:.1e})",
+                )
+
 
 def _check_rate_law(reaction_name: str, law: RateLaw, direction: str) -> None:
     if law.kind not in _RATE_LAW_PARAMS:
@@ -104,6 +179,8 @@ def validate_network(network: Network) -> None:
       - non-positive / non-finite stoichiometry    -> ILLEGAL_STOICHIOMETRY
       - negative / non-finite / incomplete rates   -> INFEASIBLE_RATE
       - source/sink reaction in a closed network   -> UNCLOSED_NETWORK
+      - illegal/contradictory compositions         -> INVALID_COMPOSITION
+      - element imbalance in a reaction            -> UNBALANCED_REACTION
     """
     if not network.species:
         raise NetworkValidationError(
@@ -116,6 +193,7 @@ def validate_network(network: Network) -> None:
                 f"species '{name}' has illegal initial concentration "
                 f"{conc!r} (must be a finite non-negative number)",
             )
+    _check_composition_declarations(network)
     for boundary in network.boundary_species:
         if boundary not in network.species:
             raise NetworkValidationError(
@@ -124,3 +202,4 @@ def validate_network(network: Network) -> None:
             )
     for reaction in network.reactions:
         _check_reaction(network, reaction)
+    _check_element_balance(network)

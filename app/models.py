@@ -38,12 +38,19 @@ class Reaction:
 class Network:
     """A reaction network. ``closed=False`` marks boundary (chemostat)
     species whose concentration is held fixed; a network with no boundary
-    species must conserve total mass."""
+    species must conserve total mass.
+
+    ``compositions`` optionally maps each species name to its atomic /
+    group composition (element -> count, e.g. ``{"C": 2, "H": 6}``).
+    It is all-or-nothing: either no species carries a composition (legacy
+    networks, balance checks skipped) or every declared species does.
+    """
 
     species: dict[str, float]  # name -> initial concentration
     reactions: tuple[Reaction, ...]
     boundary_species: frozenset[str] = frozenset()
     version: str = "1"
+    compositions: dict[str, dict[str, float]] = field(default_factory=dict)
 
     @property
     def closed(self) -> bool:

@@ -1,8 +1,9 @@
 """Error taxonomy for network validation and simulation.
 
 Every failure carries a machine-readable ``code`` so that distinct causes
-(missing species, illegal stoichiometry, infeasible rate, unclosed network)
-remain distinguishable and are never silently corrected or swallowed.
+(missing species, illegal stoichiometry, infeasible rate, unclosed network,
+invalid composition, unbalanced reaction) remain distinguishable and are
+never silently corrected or swallowed.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ class ErrorCode(str, Enum):
     UNKNOWN_PARAMETER = "UNKNOWN_PARAMETER"
     CONSERVATION_VIOLATION = "CONSERVATION_VIOLATION"
     NEGATIVE_CONCENTRATION = "NEGATIVE_CONCENTRATION"
+    UNBALANCED_REACTION = "UNBALANCED_REACTION"
+    INVALID_COMPOSITION = "INVALID_COMPOSITION"
 
 
 class NetworkError(Exception):

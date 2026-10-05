@@ -11,10 +11,11 @@ requests remain bit-for-bit reproducible.
 from __future__ import annotations
 
 import dataclasses
+from dataclasses import dataclass
 
-from .errors import ErrorCode, NetworkValidationError
+from .errors import ErrorCode, NetworkError, NetworkValidationError
 from .models import Network, RateLaw
-from .simulation import Trajectory, simulate
+from .simulation import Trajectory, network_fingerprint, simulate
 
 
 def perturb_parameter(
@@ -56,3 +57,46 @@ def scan_parameter(
         perturbed = perturb_parameter(network, reaction, param, value)
         results.append(simulate(perturbed, t_end=t_end, n_points=n_points))
     return results
+
+
+@dataclass(frozen=True)
+class ScanOutcome:
+    """One scan point: either a trajectory or the locatable error that
+    prevented it. A failed point never aborts or contaminates the rest."""
+
+    value: float
+    fingerprint: str
+    trajectory: Trajectory | None
+    error: NetworkError | None
+
+
+def scan_parameter_isolated(
+    network: Network,
+    reaction: str,
+    param: str,
+    values: list[float],
+    t_end: float,
+    n_points: int = 101,
+) -> list[ScanOutcome]:
+    """Scan one parameter, isolating per-value failures.
+
+    Unknown reaction/parameter names still raise immediately (they are
+    independent of the scanned value); a network that only fails to build
+    or simulate at specific values yields an error outcome for exactly
+    those points while the remaining points return normal trajectories.
+    """
+    outcomes = []
+    for value in values:
+        perturbed = perturb_parameter(network, reaction, param, value)
+        fingerprint = network_fingerprint(perturbed)
+        try:
+            trajectory = simulate(perturbed, t_end=t_end, n_points=n_points)
+        except NetworkError as exc:
+            outcomes.append(
+                ScanOutcome(value, fingerprint, trajectory=None, error=exc)
+            )
+        else:
+            outcomes.append(
+                ScanOutcome(value, fingerprint, trajectory, error=None)
+            )
+    return outcomes

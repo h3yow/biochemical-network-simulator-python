@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from .errors import ErrorCode, NetworkError, NetworkValidationError
 from .models import Network, RateLaw, Reaction
-from .scanning import perturb_parameter
+from .scanning import scan_parameter_isolated
 from .simulation import network_fingerprint, simulate
 from .validation import validate_network
 
@@ -40,6 +40,7 @@ class NetworkIn(BaseModel):
     reactions: list[ReactionIn] = Field(default_factory=list)
     boundary_species: list[str] = Field(default_factory=list)
     version: str = "1"
+    compositions: dict[str, dict[str, float]] = Field(default_factory=dict)
 
 
 class SimulateIn(BaseModel):
@@ -81,6 +82,7 @@ def _to_domain(net: NetworkIn) -> Network:
         ),
         boundary_species=frozenset(net.boundary_species),
         version=net.version,
+        compositions={k: dict(v) for k, v in net.compositions.items()},
     )
 
 
@@ -92,6 +94,16 @@ def _trajectory_json(tr) -> dict[str, Any]:
         "conserved_total": tr.conserved_total,
         "max_conservation_deviation": tr.max_conservation_deviation,
         "min_concentration": tr.min_concentration,
+        "conservations": [
+            {
+                "name": r.name,
+                "initial": r.initial,
+                "max_deviation": r.max_deviation,
+                "limit": r.limit,
+                "passed": r.passed,
+            }
+            for r in tr.conservations
+        ],
     }
 
 
@@ -132,17 +144,24 @@ def create_app() -> FastAPI:
     @app.post("/scan")
     def scan_endpoint(req: ScanIn) -> dict[str, Any]:
         network = _to_domain(req.network)
+        outcomes = scan_parameter_isolated(
+            network, req.reaction, req.param, req.values,
+            t_end=req.t_end, n_points=req.n_points,
+        )
         results = []
-        for value in req.values:
-            perturbed = perturb_parameter(network, req.reaction, req.param, value)
-            tr = simulate(perturbed, t_end=req.t_end, n_points=req.n_points)
-            results.append(
-                {
-                    "value": value,
-                    "fingerprint": network_fingerprint(perturbed),
-                    "trajectory": _trajectory_json(tr),
+        for outcome in outcomes:
+            entry: dict[str, Any] = {
+                "value": outcome.value,
+                "fingerprint": outcome.fingerprint,
+            }
+            if outcome.error is not None:
+                entry["error"] = {
+                    "code": outcome.error.code.value,
+                    "detail": outcome.error.detail,
                 }
-            )
+            else:
+                entry["trajectory"] = _trajectory_json(outcome.trajectory)
+            results.append(entry)
         return {"results": results}
 
     return app

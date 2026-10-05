@@ -45,6 +45,21 @@ _solution_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
 
 @dataclass(frozen=True)
+class ConservationRecord:
+    """One independent conserved quantity of the network and its drift.
+
+    ``name`` is the element/group for composition-annotated networks, or
+    ``"total"`` (sum of free-species concentrations) for legacy ones.
+    """
+
+    name: str
+    initial: float
+    max_deviation: float
+    limit: float
+    passed: bool
+
+
+@dataclass(frozen=True)
 class Trajectory:
     """Simulation result: time points and concentrations."""
 
@@ -54,10 +69,17 @@ class Trajectory:
     conserved_total: float
     max_conservation_deviation: float
     min_concentration: float
+    conservations: tuple[ConservationRecord, ...] = ()
 
 
 def network_fingerprint(network: Network) -> str:
-    """Canonical fingerprint covering every field that affects results."""
+    """Canonical fingerprint covering every field that affects results.
+
+    Compositions enter the key only when declared, so legacy networks
+    without compositions keep their historical fingerprints bit-for-bit,
+    while two networks with identical species names but different
+    compositions never share cached results.
+    """
     payload = {
         "version": network.version,
         "species": sorted(network.species.items()),
@@ -75,6 +97,11 @@ def network_fingerprint(network: Network) -> str:
             for r in network.reactions
         ],
     }
+    if network.compositions:
+        payload["compositions"] = sorted(
+            (name, sorted(comp.items()))
+            for name, comp in network.compositions.items()
+        )
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()
 
@@ -186,9 +213,11 @@ def simulate(
 ) -> Trajectory:
     """Simulate the network deterministically on [t_start, t_end].
 
-    Enforces: total mass conserved within ``conservation_tol`` for closed
-    networks; no non-physical negative concentrations. Raises
-    SimulationError with a distinguishing code otherwise.
+    Enforces: every conserved quantity of a closed network stays within
+    ``conservation_tol`` (one quantity per declared element/group when
+    compositions are present, otherwise the legacy total concentration);
+    no non-physical negative concentrations. Raises SimulationError with
+    a distinguishing code naming the violated quantity otherwise.
     """
     validate_network(network)
     if t_end <= t_start or t_start < 0:
@@ -207,17 +236,51 @@ def simulate(
 
     # --- invariant checks on the fine (unsampled) trajectory ---
     free_idx = [i for i, s in enumerate(species) if s not in network.boundary_species]
-    totals = y_fine[:, free_idx].sum(axis=1)
-    conserved_total = float(totals[0])
-    max_dev = float(np.max(np.abs(totals - conserved_total)))
-    scale = max(abs(conserved_total), 1.0)
-    if network.closed and max_dev > conservation_tol * scale:
-        raise SimulationError(
-            ErrorCode.CONSERVATION_VIOLATION,
-            f"total mass deviates by {max_dev:.3e} (tolerance "
-            f"{conservation_tol * scale:.3e}) over [0, {t_end}]",
+    free_names = [species[i] for i in free_idx]
+    y_free = y_fine[:, free_idx]
+
+    # conserved quantities: one per declared element/group when the network
+    # carries compositions, otherwise the legacy single "total" (sum of
+    # free-species concentrations) so old verdicts are unchanged
+    if network.compositions:
+        quantities = [
+            (element, np.array([network.compositions[s].get(element, 0.0)
+                                for s in free_names]))
+            for element in sorted({e for c in network.compositions.values()
+                                   for e in c})
+        ]
+    else:
+        quantities = [("total", np.ones(len(free_names)))]
+
+    records = []
+    for name, weights in quantities:
+        totals = y_free @ weights
+        initial = float(totals[0])
+        max_dev = float(np.max(np.abs(totals - initial)))
+        limit = conservation_tol * max(abs(initial), 1.0)
+        records.append(
+            ConservationRecord(
+                name=name,
+                initial=initial,
+                max_deviation=max_dev,
+                limit=limit,
+                passed=max_dev <= limit,
+            )
         )
-    min_conc = float(np.min(y_fine[:, free_idx])) if free_idx else 0.0
+    conserved_total = records[0].initial
+    max_dev = max(r.max_deviation for r in records)
+    if network.closed:
+        failures = [r for r in records if not r.passed]
+        if failures:
+            summary = "; ".join(
+                f"'{r.name}' deviates by {r.max_deviation:.3e} "
+                f"(tolerance {r.limit:.3e})" for r in failures
+            )
+            raise SimulationError(
+                ErrorCode.CONSERVATION_VIOLATION,
+                f"conserved quantity {summary} over [0, {t_end}]",
+            )
+    min_conc = float(np.min(y_free)) if free_idx else 0.0
     if min_conc < -_NEG_TOL:
         raise SimulationError(
             ErrorCode.NEGATIVE_CONCENTRATION,
@@ -232,4 +295,5 @@ def simulate(
         conserved_total=conserved_total,
         max_conservation_deviation=max_dev,
         min_concentration=max(min_conc, 0.0) if min_conc > -_NEG_TOL else min_conc,
+        conservations=tuple(records),
     )
